@@ -53,7 +53,7 @@ export async function generateTemplateFromSentence({
         content:
           "You are a senior template designer for a metric-query matcher. " +
           "You must return strict JSON only. Do not wrap the answer in markdown. " +
-          "The system only supports metric_query templates and only supports keyword_value and regex extractors."
+          "The system only supports metric_query templates and supports keyword_value, regex, time_range, and metric_conditions extractors."
       },
       {
         role: "user",
@@ -113,10 +113,15 @@ export function buildGenerationPrompt({
 - 如果出现 ip / mac / 名称 这种三选一定位方式，不要生成多个并行必填槽位；统一设计成 selector_type + selector_value
 - 模板必须是单意图
 - 尽量生成可执行的 slot_extractors
-- 只允许 keyword_value 和 regex 两种 extractor
+- 支持 keyword_value / regex / time_range / metric_conditions 四类 extractor
+- 有包含关系的 keyword_value（如 端口 / 以太网端口）要设置 "match_policy": "longest"
+- 通用时间优先用根级或模板级 {"type": "time_range"}，不要穷举所有时间词
+- 单/多指标场景优先用 metric_conditions + slot_validations 控制 exact_items / min_items
 - 如果是阈值、TopN、数值，优先给 regex
 - 如果是时间、区域、算子、实体、指标、聚合类型，优先给 keyword_value
 - 如果是设备标识、IP、MAC、名称这类自由值，优先给带前缀锚点的 regex
+- 如果后端枚举值依赖资源类型，使用 derived_slots 从语义槽位派生，不要直接把“正常/故障”写死成单一枚举
+- optional_slots 参与匹配但不保证执行参数完整；执行所需默认值写 slot_defaults
 - negative_terms 默认包含 原因 / 根因 / 报告 / 总结 / 预测
 - llm_slot_extraction 要尽量收窄，只补少量高价值槽位
 - 除非确实需要补中文数字或少量自由值，否则 llm_slot_extraction 默认关闭
@@ -176,6 +181,9 @@ ${optimizationMode}
     "negative_terms": ["..."],
     "slot_constraints": {},
     "slot_extractors": {},
+    "slot_defaults": {},
+    "derived_slots": [],
+    "slot_validations": {},
     "llm_slot_extraction": {
       "enabled": true,
       "slots": ["..."],

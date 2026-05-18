@@ -93,6 +93,14 @@
   可以在初排候选之上继续细排
 - 结构化 fallback
   LLM 兜底优先走 `json_schema`，不支持时自动回退到 `json_object`
+- 高置信模板 SQL 路由
+  新增 `route_for_sql()`，模板完全满足才返回 `route_to = template`，否则明确回退 `nl2sql`
+- 多属性联动和执行默认值
+  支持 `derived_slots` 和 `slot_defaults`，解决资源类型与枚举值联动、可选槽位缺失导致 SQL 拼接异常等问题
+- 更强的抽取器
+  `keyword_value` 支持最长匹配，新增通用 `time_range` 和可重复 `metric_conditions`
+- 轻量 compact LLM 串接
+  新增 [LLM/compact_router.py](D:/GitHub/chat_pre_check_blank/src/template_capability/LLM/compact_router.py)，固定规则放 system prompt，每次只传 top 候选的极简 payload
 - 更强的诊断 trace
   可以看到 `global_slots / unexpected_global_slots / requirement_issues / structure_details / rerank_trace`
 
@@ -109,7 +117,9 @@
 7. 命中候选后，按模板自己的 `slot_extractors` 做模板内提参
 8. `slot_fit` + `constraint` + `structure_score`：模板约束和结构校验
 9. 可选 LLM fallback：支持模板选择裁决和模板级补参
-10. 阈值和歧义判断：输出 `matched / partial / unmatched`
+10. `slot_defaults / derived_slots / slot_validations`：补默认值、派生联动槽位、校验集合约束
+11. 阈值和歧义判断：输出 `matched / partial / unmatched`
+12. SQL 路由场景可走 `route_for_sql()` 或 compact LLM 串接，只有模板满足才放行，否则回退 NL2SQL
 
 设计原则：
 
@@ -119,6 +129,7 @@
 - 大模型默认不进入主链路；只支持命中后的模板级窄触发补参
 - 向量后端可替换，默认按 `512` 维接口设计
 - 模板扩展后必须可批量评测
+- 面向 SQL 执行的入口必须比普通 `match()` 更保守：不能满足模板就回退 NL2SQL
 
 ## 流程能力说明
 
@@ -380,6 +391,65 @@
 - 这是系统的安全阀
 - 宁可保守一点，也不要把不确定结果硬判成命中，这样更适合真实业务落地
 
+### 11. 高置信 SQL 路由
+
+做什么：
+
+- 为“模板 SQL”和“NL2SQL”之间做保守路由
+
+输入：
+
+- 用户 query
+- 当前模板配置
+
+输出：
+
+- `route_to = template`：模板完整满足，可以直接走模板 SQL
+- `route_to = nl2sql`：模板不满足或不够稳定，交给 NL2SQL
+
+典型用例：
+
+- `查询硬盘健康状态为正常的列表`
+  如果资源类型、健康状态、查询动作和派生枚举都满足模板，则走模板
+- `查询硬盘健康状态为未知的列表`
+  如果状态语义不在模板可解释范围内，则回退 NL2SQL
+
+算法与原因：
+
+- 它复用当前多路召回，但门槛比普通 `match()` 更保守
+- 分数低、top 候选歧义、结构分不足、模板约束不满足，都会直接回退
+- 这样可以把模板能力作为“高置信快捷路径”，而不是强行覆盖所有 query
+
+### 12. compact LLM 快速提参
+
+做什么：
+
+- 在高置信 top1/top3 候选上，用极小 payload 让 LLM 补少量槽位或拒绝模板
+
+输入：
+
+- 固定 system prompt
+- 每次请求只传 `q / g / c`
+  - `q`：原始 query
+  - `g`：规则链路已抽到的公共槽位
+  - `c`：top 候选的极简字段
+
+输出：
+
+- `{"r":"template","id":"...","s":{},"m":[],"cf":0.0}`
+- 或 `{"r":"nl2sql","id":-1,"s":{},"m":[],"cf":0.0}`
+
+典型用例：
+
+- 模板已经大概率对，但某个自由文本或语义槽位规则没有抽到
+- top1 是单指标模板，但 query 明确包含两个指标条件，LLM 必须返回 `nl2sql`
+
+算法与原因：
+
+- 固定规则放进 system prompt，减少每次请求 token
+- user payload 不传 `description / utterances / must_terms` 这类大字段
+- LLM 输出后仍然回到确定性校验，不满足模板就回退 NL2SQL
+
 ## 目录结构
 
 ```text
@@ -388,6 +458,9 @@
 |   |-- query_rewrite_rules.json
 |   `-- templates.json
 |-- src/template_capability/
+|   |-- LLM/
+|   |   |-- __init__.py
+|   |   `-- compact_router.py
 |   |-- config.py
 |   |-- engine.py
 |   |-- evaluation.py
@@ -413,6 +486,8 @@
 |   |-- test_openai_sdk_integration.py
 |   |-- test_rerankers.py
 |   |-- test_structured_fallback.py
+|   |-- test_compact_llm_router.py
+|   |-- test_sql_route_extensions.py
 |   |-- test_template_constraints.py
 |   `-- test_term_match_modes.py
 |-- tools/
@@ -435,6 +510,42 @@ pip install -e ".[dev]"
 
 ```bash
 python main.py --input "过去24小时接口错包告警前10名"
+```
+
+代码内高置信 SQL 路由：
+
+```python
+from template_capability.engine import TemplateCapabilityEngine
+
+engine = TemplateCapabilityEngine.from_file("configs/templates.json")
+decision = engine.route_for_sql("查询硬盘健康状态为正常的列表")
+
+payload = decision.to_dict()
+if payload["route_to"] == "template":
+    # 直接走模板 SQL
+    slots = payload["result"]["slots"]
+else:
+    # 回退 NL2SQL
+    pass
+```
+
+代码内 compact LLM 串接：
+
+```python
+from template_capability.engine import TemplateCapabilityEngine
+from template_capability.LLM import route_with_compact_llm
+
+engine = TemplateCapabilityEngine.from_file("configs/templates.json")
+
+def real_llm_call(system_prompt, user_payload):
+    # 这里替换成真实模型调用，返回 dict 或 JSON string
+    return None
+
+decision = route_with_compact_llm(
+    engine,
+    "查询硬盘健康状态为正常的列表",
+    llm_call=real_llm_call,
+)
 ```
 
 交互模式：
@@ -472,6 +583,8 @@ start-template-studio.cmd
 ```
 
 ## 输出契约
+
+普通 `match()` 的输出仍然是 `MatchResult`，保持向后兼容。
 
 示例：
 
@@ -518,6 +631,43 @@ start-template-studio.cmd
   如果模板启用了组合槽位约束，还会看到 `requirement_issues`
   结构分细节会放在候选模板的 `trace.structure_details`
   如果开启了二阶段精排，还会看到 `rerank_score` 和 `trace.rerank_trace`
+
+SQL 路由入口 `route_for_sql()` 返回 `TemplateRouteDecision`：
+
+```json
+{
+  "route_to": "template",
+  "reason": "template_satisfied",
+  "result": {
+    "template_id": "resource.health.list",
+    "status": "matched",
+    "score": 0.91,
+    "query_mode": "metric_query",
+    "slots": {
+      "resource_type": "disk",
+      "health_status_label": "normal",
+      "healthStatus": 2,
+      "query_operator": "list"
+    },
+    "missing_slots": [],
+    "metadata": {},
+    "trace": {}
+  },
+  "candidates": []
+}
+```
+
+字段说明：
+
+- `route_to`
+  `template` 表示可直接走模板 SQL
+  `nl2sql` 表示模板不够稳定或不满足，应该交给 NL2SQL
+- `reason`
+  当前路由原因，例如 `template_satisfied / low_template_confidence / template_requirements_not_satisfied`
+- `result`
+  与普通 `MatchResult` 结构一致
+- `candidates`
+  用于调试的候选模板轨迹
 
 ## 配置说明
 
@@ -591,6 +741,10 @@ start-template-studio.cmd
   模板已命中后的 LLM 补参开关
   这是当前更推荐的用法
   只在 top1 模板比较稳定，但还有少量关键槽位没抽到时补参
+- `template_route`
+  面向 SQL 路由的保守门槛
+  `route_for_sql()` 和 compact LLM 串接会使用它
+  常见字段是 `min_score / min_structure_score / top_k`
 
 `weights` 的含义：
 
@@ -668,6 +822,31 @@ start-template-studio.cmd
 - `allow_on_matched`
   即使已经 `matched`，是否还允许 LLM 二次补参
   默认建议关闭，除非你确实需要补充可选槽位
+
+`template_route` 示例：
+
+```json
+{
+  "matcher": {
+    "template_route": {
+      "min_score": 0.62,
+      "min_structure_score": 0.3,
+      "top_k": 1
+    }
+  }
+}
+```
+
+字段说明：
+
+- `min_score`
+  候选模板至少达到这个分数，才允许进入模板 SQL 路由
+- `min_structure_score`
+  结构分下限，用来挡住“文本很像但条件结构接不住”的模板
+- `top_k`
+  compact LLM 最多查看几个候选
+  默认建议 `1`
+  只有 top1/top2 差距很小且你愿意多付一点时延时，再调到 `2-3`
 
 ### query_rewrite
 
@@ -748,24 +927,39 @@ start-template-studio.cmd
 
 根级 `slot_extractors` 现在主要用于兼容旧配置；主路径推荐把参数抽取下沉到每个模板的 `slot_extractors`。
 
-槽位抽取内置两类抽取器：
+槽位抽取内置四类抽取器：
 
 - `keyword_value`
 - `regex`
+- `time_range`
+- `metric_conditions`
 
 `keyword_value` 适合：
 
-- 时间表达
 - 区域
 - 指标
 - 查询算子
 - 严重级别
+- 有限枚举值
 
 `regex` 适合：
 
 - `topn`
 - 数字类参数
 - 格式稳定的标识
+
+`time_range` 适合：
+
+- 今天、昨天、前天
+- 最近 N 小时 / N 天 / N 周 / N 月
+- 过去 N 天
+- 日期和日期范围
+
+`metric_conditions` 适合：
+
+- 单指标阈值条件
+- 多指标阈值条件
+- 单/多指标模板区分
 
 模板内 `keyword_value` 示例：
 
@@ -788,6 +982,26 @@ start-template-studio.cmd
         }
       ]
     }
+  }
+}
+```
+
+如果 case 之间有包含关系，建议开启最长匹配：
+
+```json
+{
+  "resource_type": {
+    "extractors": [
+      {
+        "type": "keyword_value",
+        "match_policy": "longest",
+        "cases": [
+          {"terms": ["端口"], "value": "generic_port"},
+          {"terms": ["FC端口", "FCoE端口", "SAS端口"], "value": "storage_port"},
+          {"terms": ["以太网端口"], "value": "ethernet_port"}
+        ]
+      }
+    ]
   }
 }
 ```
@@ -815,6 +1029,48 @@ start-template-studio.cmd
 }
 ```
 
+通用时间抽取示例：
+
+```json
+{
+  "time_range": {
+    "extractors": [
+      {
+        "type": "time_range",
+        "include_absolute": true
+      }
+    ]
+  }
+}
+```
+
+多指标条件抽取示例：
+
+```json
+{
+  "metric_conditions": {
+    "extractors": [
+      {
+        "type": "metric_conditions",
+        "metrics": [
+          {"terms": ["内存利用率", "内存"], "value": "memory_usage"},
+          {"terms": ["CPU利用率", "cpu"], "value": "cpu_usage"}
+        ]
+      }
+    ]
+  }
+}
+```
+
+抽取结果形如：
+
+```json
+[
+  {"metric": "memory_usage", "operator": ">", "value": 50.0},
+  {"metric": "cpu_usage", "operator": ">", "value": 90.0}
+]
+```
+
 ### templates
 
 模板字段：
@@ -832,6 +1088,9 @@ start-template-studio.cmd
 - `negative_terms`：模板级负向词
 - `slot_constraints`：槽位约束
 - `slot_extractors`：该模板自己的参数抽取规则
+- `slot_defaults`：最终输出前补齐的默认执行参数
+- `derived_slots`：由多个语义槽位派生出的后端槽位
+- `slot_validations`：列表型槽位或集合槽位的数量约束
 - `llm_slot_extraction`：该模板的可选 LLM 补参配置
 - `metadata`：业务透传字段
 
@@ -861,6 +1120,16 @@ start-template-studio.cmd
 - `llm_slot_extraction`
   控制该模板是否允许 LLM 补参，以及补哪些槽位
   这是模板级开关，不是全局一刀切
+- `slot_defaults`
+  只在最终输出和 SQL 路由前补齐
+  它不会参与早期召回，避免默认值把不该命中的模板垫高
+- `derived_slots`
+  适合表达“同一个语义值在不同资源类型下对应不同后端枚举”
+  例如 `resource_type=disk + health_status_label=normal -> healthStatus=2`
+- `slot_validations`
+  适合限制集合槽位数量
+  例如单指标模板要求 `metric_conditions.exact_items = 1`
+  多指标模板要求 `metric_conditions.min_items = 2`
 
 模板示例：
 
@@ -891,6 +1160,12 @@ start-template-studio.cmd
       "extractors": []
     }
   },
+  "slot_defaults": {
+    "page_no": 1,
+    "page_size": 100
+  },
+  "derived_slots": [],
+  "slot_validations": {},
   "llm_slot_extraction": {
     "enabled": true,
     "slots": ["time_range", "region_id", "query_operator"],
@@ -901,6 +1176,62 @@ start-template-studio.cmd
   }
 }
 ```
+
+多属性联动示例：
+
+```json
+{
+  "template_id": "resource.health.list",
+  "required_slots": [
+    "resource_type",
+    "health_status_label",
+    "healthStatus",
+    "query_operator"
+  ],
+  "derived_slots": [
+    {
+      "slot_name": "healthStatus",
+      "source_slots": ["resource_type", "health_status_label"],
+      "mapping": [
+        {
+          "when": {"resource_type": "storage_pool", "health_status_label": "normal"},
+          "value": 1
+        },
+        {
+          "when": {"resource_type": "disk", "health_status_label": "normal"},
+          "value": 2
+        }
+      ]
+    }
+  ]
+}
+```
+
+这里不要直接让“正常”抽成 `healthStatus`。先抽语义槽位，再由 `derived_slots` 做确定性派生，才能处理不同资源类型下枚举值不同甚至相反的问题。
+
+单/多指标模板示例：
+
+```json
+{
+  "template_id": "storage.single_metric.list",
+  "required_slots": ["query_operator", "metric_conditions"],
+  "slot_validations": {
+    "metric_conditions": {"exact_items": 1}
+  }
+}
+```
+
+```json
+{
+  "template_id": "storage.multi_metric.list",
+  "required_slots": ["query_operator", "metric_conditions"],
+  "slot_validations": {
+    "metric_conditions": {"min_items": 2}
+  }
+}
+```
+
+这样 `查询今天内存利用率大于50% CPU利用率大于90%的分布式存储列表` 不会被单指标模板吞掉。
 
 如果你需要边界匹配，也可以这样写：
 
@@ -949,7 +1280,11 @@ start-template-studio.cmd
 7. `slot_fit_score` 槽位覆盖度
 8. `constraint_score` 模板约束得分
 9. `structure_score` 结构一致性得分
-10. 可选模板级 LLM 补参
+10. `slot_validations` 集合约束校验
+11. `derived_slots` 派生联动槽位
+12. `slot_defaults` 补齐执行默认值
+13. 可选模板级 LLM 补参或 compact LLM 快速提参
+14. SQL 路由入口按高置信门槛决定 `template / nl2sql`
 
 最终分数：
 
@@ -975,6 +1310,9 @@ total_score =
 - `constraint` 防止“看起来像，但其实不是这个模板”
 - `structure_score` 会同时惩罚两类问题：
   query 里多出的条件模板接不住；模板要求的关键过滤条件 query 没给全
+- `slot_validations` 解决单/多指标模板混淆
+- `derived_slots` 解决资源类型与状态枚举等联动映射
+- `slot_defaults` 解决可选槽位缺失时的 SQL 执行默认值
 
 ## 向量接口接入
 
@@ -1039,7 +1377,7 @@ class VectorSearchBackend(Protocol):
 
 推荐顺序：
 
-1. 先判断这个槽位是否能通过 `keyword_value` 或 `regex` 表达
+1. 先判断这个槽位是否能通过 `keyword_value / regex / time_range / metric_conditions` 表达
 2. 如果可以，优先只改配置
 3. 如果配置表达不了，再扩 `extractors.py`
 4. 补抽取测试和回归样本
@@ -1050,6 +1388,7 @@ class VectorSearchBackend(Protocol):
 - 不要把模板追问文案混入能力层
 - 不要为了一个模板改全局逻辑
 - 不要先做全局通用抽参，再去套模板；优先按模板内规则抽参
+- 不要把依赖资源类型的后端枚举直接写进单个语义 extractor；优先用 `derived_slots`
 
 ### 调权重和阈值
 
@@ -1107,6 +1446,12 @@ python tools/evaluate_matcher.py --fail-on-errors
 当前测试覆盖：
 
 - 槽位抽取
+- 最长 keyword 匹配
+- 通用时间抽取
+- 多属性联动派生槽位
+- 可选槽位默认值
+- 单/多指标条件区分
+- compact LLM 路由串接
 - 多表达泛化
 - 非问数意图拦截
 - 歧义模板返回 `-1`
@@ -1224,6 +1569,75 @@ $env:DASHSCOPE_API_KEY="***"
 python -m pytest -q tests/test_live_llm_slot_fallback.py
 ```
 
+## Compact LLM 路由
+
+除了旧的模板选择 fallback 和模板级补参，现在还提供了一个更适合线上低延迟场景的 compact LLM 串接模块：
+
+- [LLM/compact_router.py](D:/GitHub/chat_pre_check_blank/src/template_capability/LLM/compact_router.py)
+
+它的目标不是让 LLM 做全量模板推理，而是：
+
+1. 先用当前多路召回快速得到 top1/top3
+2. 只把极简候选 payload 给 LLM
+3. LLM 只返回模板 id 和槽位
+4. 系统再做确定性校验
+5. 不满足模板就回退 NL2SQL
+
+固定规则放在 `COMPACT_SLOT_ROUTER_SYSTEM_PROMPT` 中，每次请求只需要传：
+
+```json
+{
+  "q": "查询硬盘健康状态为正常的列表",
+  "g": {
+    "resource_type": "disk"
+  },
+  "c": [
+    {
+      "id": "resource.health.list",
+      "sc": 0.82,
+      "st": 0.91,
+      "req": ["resource_type", "health_status_label", "query_operator"],
+      "cur": {"resource_type": "disk"},
+      "miss": ["health_status_label"],
+      "schema": {
+        "health_status_label": ["normal", "fault"],
+        "query_operator": ["list"]
+      },
+      "derive": {
+        "healthStatus": ["resource_type", "health_status_label"]
+      }
+    }
+  ]
+}
+```
+
+LLM 只需要返回：
+
+```json
+{"r":"template","id":"resource.health.list","s":{"health_status_label":"normal","query_operator":"list"},"m":[],"cf":0.93}
+```
+
+代码接入：
+
+```python
+from template_capability.engine import TemplateCapabilityEngine
+from template_capability.LLM import route_with_compact_llm
+
+engine = TemplateCapabilityEngine.from_file("configs/templates.json")
+
+def real_llm_call(system_prompt, user_payload):
+    # 替换为真实模型调用；返回 dict 或 JSON string
+    return None
+
+decision = route_with_compact_llm(
+    engine,
+    "查询硬盘健康状态为正常的列表",
+    llm_call=real_llm_call,
+)
+```
+
+如果 `real_llm_call` 返回 `None`、选择未知模板、结构分不够、或最终规则校验不通过，都会返回 `route_to = nl2sql`。
+
 ## 代码入口说明
 
 主要文件职责：
@@ -1232,6 +1646,7 @@ python -m pytest -q tests/test_live_llm_slot_fallback.py
 - [template-studio/server.js](D:/GitHub/chat_pre_check_blank/template-studio/server.js)：Node.js 本地模板工作台服务
 - [template-studio/public/app.js](D:/GitHub/chat_pre_check_blank/template-studio/public/app.js)：模板工作台前端交互
 - [engine.py](D:/GitHub/chat_pre_check_blank/src/template_capability/engine.py)：主匹配流程
+- [compact_router.py](D:/GitHub/chat_pre_check_blank/src/template_capability/LLM/compact_router.py)：compact LLM 路由和极简 payload 构造
 - [extractors.py](D:/GitHub/chat_pre_check_blank/src/template_capability/extractors.py)：标准化和槽位抽取
 - [scoring.py](D:/GitHub/chat_pre_check_blank/src/template_capability/scoring.py)：召回、相似度、约束打分
 - [vector_index.py](D:/GitHub/chat_pre_check_blank/src/template_capability/vector_index.py)：向量后端抽象和默认实现
@@ -1282,6 +1697,11 @@ python -m pytest -q tests/test_live_llm_slot_fallback.py
 
 - 配置驱动模板匹配
 - 通用槽位抽取
+- 高置信 SQL 路由
+- compact LLM 快速提参串接
+- 多属性联动派生槽位
+- 可选槽位默认值
+- 单/多指标条件校验
 - 可替换 `512` 维向量后端
 - 静态评测集
 - 批量评测报告
@@ -1294,6 +1714,12 @@ python -m pytest -q
 python tools/evaluate_matcher.py
 npm run studio:test
 ```
+
+当前回归结果：
+
+- Python：`191 passed, 1 skipped`
+- Node Template Studio：`20 passed`
+- 静态评测：`75 / 75`
 
 ## Template Studio
 
@@ -1311,6 +1737,8 @@ npm run studio:test
 - 返回“为什么这样设计”的说明，方便人工微调模板
 - 支持一键跑仓库内置评测集
 - 支持把模板原始 JSON 放到弹层查看，避免编辑区过长
+- 支持编辑 `slot_defaults / derived_slots / slot_validations`
+- 提供 `/api/route-for-sql` 用于调试 SQL 路由决策
 - 导出当前模板文件
 - 保存一份工作区快照，便于下次继续编辑
 

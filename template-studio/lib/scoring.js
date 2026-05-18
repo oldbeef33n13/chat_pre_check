@@ -2,7 +2,7 @@ import { clampScore } from "./utils.js";
 
 const TOKEN_RE = /[a-z0-9_.-]+|[\u4e00-\u9fff]+/g;
 const LOW_SIGNAL_SLOTS = new Set(["time_range", "region_id"]);
-const FILTER_SLOTS = new Set(["topn", "severity", "device_id", "protocol", "query_operator"]);
+const FILTER_SLOTS = new Set(["topn", "severity", "device_id", "protocol", "query_operator", "metric_conditions"]);
 
 export function mixedTerms(text) {
   const chunks = String(text || "").toLowerCase().match(TOKEN_RE) || [];
@@ -150,20 +150,23 @@ export function slotFitScore(template, slots) {
   const required = template.required_slots || [];
   const optional = template.optional_slots || [];
   if (!required.length && !optional.length) {
-    return 1;
+    const validationScores = slotValidationScores(template, slots);
+    return validationScores.length ? average(validationScores) : 1;
   }
   const requiredHit = coverageScore(required, slots);
+  const validationScores = slotValidationScores(template, slots);
+  const coreHit = validationScores.length ? average([requiredHit, average(validationScores)]) : requiredHit;
   if (!optional.length) {
-    return requiredHit;
+    return coreHit;
   }
   const optionalHit = coverageScore(optional, slots);
-  return clampScore(requiredHit * 0.8 + optionalHit * 0.2);
+  return clampScore(coreHit * 0.8 + optionalHit * 0.2);
 }
 
 export function structuralAlignmentScore(template, slots) {
   const extractedSlots = new Set(
     Object.entries(slots)
-      .filter(([, value]) => value !== null && value !== undefined && value !== "")
+      .filter(([, value]) => slotPresentValue(value))
       .map(([slotName]) => slotName)
   );
   if (!extractedSlots.size) {
@@ -253,7 +256,7 @@ export function weightedScore(parts, weights) {
 export function adaptiveScoreWeights(baseWeights, slots) {
   const weights = { ...baseWeights };
   const filterSlotCount = Object.entries(slots).filter(
-    ([slotName, value]) => value !== null && value !== undefined && value !== "" && isFilterSlot(slotName)
+    ([slotName, value]) => slotPresentValue(value) && isFilterSlot(slotName)
   ).length;
   const complexity = Math.min(1, filterSlotCount / 3);
   if (complexity <= 0) {
@@ -280,10 +283,27 @@ export function adaptiveScoreWeights(baseWeights, slots) {
 }
 
 export function missingRequiredSlots(template, slots) {
-  return (template.required_slots || []).filter((slotName) => {
-    const value = slots[slotName];
-    return value === null || value === undefined || value === "";
-  });
+  const missing = (template.required_slots || []).filter((slotName) => !slotPresent(slots, slotName));
+  for (const [slotName, rule] of Object.entries(template.slot_validations || {})) {
+    const count = slotItemCount(slots[slotName]);
+    if (rule.exact_items !== undefined && rule.exact_items !== null && count !== Number(rule.exact_items)) {
+      if (!missing.includes(slotName)) {
+        missing.push(slotName);
+      }
+      continue;
+    }
+    if (rule.min_items !== undefined && rule.min_items !== null && count < Number(rule.min_items)) {
+      if (!missing.includes(slotName)) {
+        missing.push(slotName);
+      }
+    }
+    if (rule.max_items !== undefined && rule.max_items !== null && count > Number(rule.max_items)) {
+      if (!missing.includes(slotName)) {
+        missing.push(slotName);
+      }
+    }
+  }
+  return missing;
 }
 
 function coverageScore(slotNames, slots) {
@@ -291,10 +311,27 @@ function coverageScore(slotNames, slots) {
     return 1;
   }
   const hit = slotNames.filter((slotName) => {
-    const value = slots[slotName];
-    return value !== null && value !== undefined && value !== "";
+    return slotPresent(slots, slotName);
   }).length;
   return hit / slotNames.length;
+}
+
+function slotValidationScores(template, slots) {
+  return Object.entries(template.slot_validations || {}).map(([slotName, rule]) => slotValidationScore(slotName, rule, slots));
+}
+
+function slotValidationScore(slotName, rule, slots) {
+  const count = slotItemCount(slots[slotName]);
+  if (rule.exact_items !== undefined && rule.exact_items !== null) {
+    return count === Number(rule.exact_items) ? 1 : 0;
+  }
+  if (rule.min_items !== undefined && rule.min_items !== null && count < Number(rule.min_items)) {
+    return count / Math.max(1, Number(rule.min_items));
+  }
+  if (rule.max_items !== undefined && rule.max_items !== null && count > Number(rule.max_items)) {
+    return Math.max(0, Number(rule.max_items) / Math.max(1, count));
+  }
+  return 1;
 }
 
 function containsCjk(text) {
@@ -363,6 +400,9 @@ function matchesAllowedValues(extracted, allowedValues) {
 }
 
 function slotSignalWeight(slotName) {
+  if (slotName === "metric_conditions") {
+    return 2;
+  }
   if (LOW_SIGNAL_SLOTS.has(slotName)) {
     return 0.5;
   }
@@ -371,6 +411,33 @@ function slotSignalWeight(slotName) {
   }
   if (FILTER_SLOTS.has(slotName)) {
     return 1.25;
+  }
+  return 1;
+}
+
+function slotPresent(slots, slotName) {
+  return slotPresentValue(slots[slotName]);
+}
+
+function slotPresentValue(value) {
+  if (value === null || value === undefined || value === "") {
+    return false;
+  }
+  if (Array.isArray(value) && !value.length) {
+    return false;
+  }
+  if (value && typeof value === "object" && !Array.isArray(value) && !Object.keys(value).length) {
+    return false;
+  }
+  return true;
+}
+
+function slotItemCount(value) {
+  if (!slotPresentValue(value)) {
+    return 0;
+  }
+  if (Array.isArray(value)) {
+    return value.length;
   }
   return 1;
 }

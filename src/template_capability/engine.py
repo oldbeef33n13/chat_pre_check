@@ -12,11 +12,13 @@ from template_capability.fallback import (
     LLMTemplateSlotResolver,
 )
 from template_capability.models import (
+    DerivedSlotDefinition,
     MatchResult,
     MatchStatus,
     SlotExtractorDefinition,
     TemplateCandidate,
     TemplateDefinition,
+    TemplateRouteDecision,
     template_declared_slot_names,
 )
 from template_capability.rerankers import (
@@ -61,6 +63,9 @@ HIGH_SIGNAL_EXACT_SLOTS = {
     "selector_value",
     "time_range",
     "region_id",
+    "resource_type",
+    "health_status_label",
+    "metric_conditions",
 }
 
 
@@ -216,6 +221,12 @@ class TemplateCapabilityEngine:
             candidate=top,
             status=status,
         )
+        top = self._rebuild_candidate(
+            top,
+            norm_text=norm_text,
+            global_slots=global_slots,
+            include_defaults=True,
+        )
         # 如果 top1 因为补参而发生变化，需要让 trace 里的 top_candidates
         # 也反映补参后的最新 top1，而不是旧版本。
         display_candidates = [top] + [
@@ -272,6 +283,138 @@ class TemplateCapabilityEngine:
     def route(self, input_text: str) -> MatchResult:
         """兼容旧入口。"""
         return self.match(input_text)
+
+    def route_for_sql(self, input_text: str) -> TemplateRouteDecision:
+        """面向“模板 SQL vs NL2SQL”的高置信路由入口。
+
+        这个入口比 `match()` 更保守：
+        - 快速召回分数不够，直接 `nl2sql`
+        - 模板结构分不够，直接 `nl2sql`
+        - 经过默认值、派生槽位和可选 LLM 补参后仍不满足模板，直接 `nl2sql`
+        """
+
+        original_norm_text = normalize_text(input_text)
+        rewrite_result = self.query_rewriter.rewrite_normalized(original_norm_text)
+        norm_text = rewrite_result.rewritten_text
+        shared_slots = self.slot_registry.extract(norm_text)
+        global_slots = self.global_slot_registry.extract(norm_text)
+        diagnostic_slots = _merge_slot_maps(shared_slots, global_slots)
+        blocked_term = self._match_blocked_term(norm_text)
+        if blocked_term is not None:
+            result = MatchResult(
+                template_id=-1,
+                status=MatchStatus.UNMATCHED,
+                score=0.0,
+                query_mode=None,
+                slots=diagnostic_slots,
+                trace={
+                    "norm_text": norm_text,
+                    "original_norm_text": original_norm_text,
+                    "rewrite_trace": rewrite_result.to_dict(),
+                    "blocked_term": blocked_term,
+                    "route_to": "nl2sql",
+                    "reason": "blocked_intent",
+                },
+            )
+            return TemplateRouteDecision(route_to="nl2sql", result=result, reason="blocked_intent")
+
+        ranked = self._rank_templates(norm_text, global_slots)
+        top = ranked[0] if ranked else None
+        second = ranked[1] if len(ranked) > 1 else None
+        if top is None:
+            return self._build_nl2sql_route_result(
+                reason="no_template_candidate",
+                norm_text=norm_text,
+                original_norm_text=original_norm_text,
+                rewrite_trace=rewrite_result.to_dict(),
+                slots=diagnostic_slots,
+                ranked=ranked,
+            )
+        if top.score < self.config.settings.template_route_min_score:
+            return self._build_nl2sql_route_result(
+                reason="low_template_confidence",
+                norm_text=norm_text,
+                original_norm_text=original_norm_text,
+                rewrite_trace=rewrite_result.to_dict(),
+                slots=diagnostic_slots,
+                ranked=ranked,
+            )
+        if self._is_ambiguous(top, second):
+            return self._build_nl2sql_route_result(
+                reason="ambiguous_template_candidates",
+                norm_text=norm_text,
+                original_norm_text=original_norm_text,
+                rewrite_trace=rewrite_result.to_dict(),
+                slots=diagnostic_slots,
+                ranked=ranked,
+            )
+
+        evaluated_candidates: list[TemplateCandidate] = []
+        for candidate in ranked[: self.config.settings.template_route_top_k]:
+            if candidate.score < self.config.settings.template_route_min_score:
+                continue
+            if candidate.structure_score < self.config.settings.template_route_min_structure_score:
+                evaluated_candidates.append(candidate)
+                continue
+            template = self.templates[candidate.template_id]
+            requirement_report = evaluate_slot_requirements(template, candidate.slots)
+            status = MatchStatus.MATCHED if requirement_report.is_satisfied else MatchStatus.PARTIAL
+            enriched = self._resolve_template_slots_with_fallback(
+                input_text=input_text,
+                norm_text=norm_text,
+                global_slots=global_slots,
+                candidate=candidate,
+                status=status,
+            )
+            finalized = self._rebuild_candidate(
+                enriched,
+                norm_text=norm_text,
+                global_slots=global_slots,
+                include_defaults=True,
+            )
+            evaluated_candidates.append(finalized)
+            final_report = evaluate_slot_requirements(template, finalized.slots)
+            if (
+                final_report.is_satisfied
+                and finalized.score >= self.config.settings.template_route_min_score
+                and finalized.structure_score >= self.config.settings.template_route_min_structure_score
+            ):
+                result = MatchResult(
+                    template_id=template.template_id,
+                    status=MatchStatus.MATCHED,
+                    score=finalized.score,
+                    query_mode=template.query_mode,
+                    slots=finalized.slots,
+                    missing_slots=[],
+                    metadata=template.metadata,
+                    trace={
+                        "norm_text": norm_text,
+                        "original_norm_text": original_norm_text,
+                        "shared_slots": shared_slots,
+                        "global_slots": global_slots,
+                        "rewrite_trace": rewrite_result.to_dict(),
+                        "route_to": "template",
+                        "reason": "template_satisfied",
+                        "requirement_issues": [],
+                        "selected_template": finalized.to_dict(),
+                        "top_candidates": [item.to_dict() for item in evaluated_candidates[:5]],
+                    },
+                )
+                return TemplateRouteDecision(
+                    route_to="template",
+                    result=result,
+                    reason="template_satisfied",
+                    candidates=evaluated_candidates,
+                )
+
+        return self._build_nl2sql_route_result(
+            reason="template_requirements_not_satisfied",
+            norm_text=norm_text,
+            original_norm_text=original_norm_text,
+            rewrite_trace=rewrite_result.to_dict(),
+            slots=diagnostic_slots,
+            ranked=evaluated_candidates or ranked,
+        )
 
     def _rank_templates(
         self,
@@ -459,9 +602,15 @@ class TemplateCapabilityEngine:
         slots: dict[str, object],
         weights: dict[str, float],
         rerank_trace: dict[str, object] | None = None,
+        include_defaults: bool = False,
     ) -> TemplateCandidate:
         """把一个模板在当前 query 下的所有子分数组装成最终候选。"""
         template = self.templates[template_id]
+        slots, slot_resolution_trace = self._resolve_slots_for_template(
+            template,
+            slots,
+            include_defaults=include_defaults,
+        )
         # slot_fit 看“该有的槽位有没有抽出来”，
         # constraint 看“抽到的值是否满足模板显式约束”，
         # structure 看“query 的条件复杂度和模板结构是否对得上”。
@@ -514,10 +663,82 @@ class TemplateCapabilityEngine:
                 "structure_details": structure_report.to_dict(),
                 "requirement_issues": requirement_report.to_dict()["issues"],
                 "blocking_issue_count": len(requirement_report.issues),
+                "slot_resolution": slot_resolution_trace,
                 "rerank_trace": dict(rerank_trace or {}),
             },
             metadata=template.metadata,
         )
+
+    def _rebuild_candidate(
+        self,
+        candidate: TemplateCandidate,
+        *,
+        norm_text: str,
+        global_slots: dict[str, object],
+        include_defaults: bool = False,
+    ) -> TemplateCandidate:
+        """用同一组召回子分重新计算槽位相关分数。"""
+        weights = adaptive_score_weights(
+            self.config.settings.weights,
+            _merge_slot_maps(global_slots, candidate.slots),
+        )
+        rebuilt = self._build_candidate(
+            template_id=candidate.template_id,
+            norm_text=norm_text,
+            global_slots=global_slots,
+            lexical_score=candidate.lexical_score,
+            sample_score=candidate.sample_score,
+            vector_score=candidate.vector_score,
+            fusion_score=candidate.fusion_score,
+            rerank_score=candidate.rerank_score,
+            slots=candidate.slots,
+            weights=weights,
+            rerank_trace=dict(candidate.trace.get("rerank_trace", {})),
+            include_defaults=include_defaults,
+        )
+        for key in ("slot_fallback_used", "slot_fallback_trace"):
+            if key in candidate.trace:
+                rebuilt.trace[key] = candidate.trace[key]
+        return rebuilt
+
+    def _resolve_slots_for_template(
+        self,
+        template: TemplateDefinition,
+        slots: dict[str, object],
+        *,
+        include_defaults: bool,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        """补充默认值和派生槽位，返回可追踪的槽位来源。"""
+        resolved: dict[str, object] = dict(slots)
+        trace: dict[str, object] = {
+            "defaults_applied": {},
+            "derived_applied": {},
+        }
+        if include_defaults:
+            defaults_applied: dict[str, object] = {}
+            for slot_name, value in template.slot_defaults.items():
+                if _slot_value_present(resolved.get(slot_name)):
+                    continue
+                resolved[slot_name] = copy.deepcopy(value)
+                defaults_applied[slot_name] = copy.deepcopy(value)
+            trace["defaults_applied"] = defaults_applied
+
+        derived_applied: dict[str, object] = {}
+        for _ in range(3):
+            changed = False
+            for rule in template.derived_slots:
+                if not rule.overwrite and _slot_value_present(resolved.get(rule.slot_name)):
+                    continue
+                value = _derive_slot_value(rule, resolved)
+                if not _slot_value_present(value):
+                    continue
+                resolved[rule.slot_name] = copy.deepcopy(value)
+                derived_applied[rule.slot_name] = copy.deepcopy(value)
+                changed = True
+            if not changed:
+                break
+        trace["derived_applied"] = derived_applied
+        return resolved, trace
 
     def _is_ambiguous(
         self,
@@ -688,20 +909,71 @@ class TemplateCapabilityEngine:
         suggestion: FallbackSuggestion,
     ) -> MatchResult:
         """把模板选择 fallback 的结果转成统一输出。"""
+        slots = dict(suggestion.slots)
+        missing_slots = list(suggestion.missing_slots)
+        status = suggestion.status
+        slot_resolution_trace: dict[str, object] = {}
+        if isinstance(suggestion.template_id, str) and suggestion.template_id in self.templates:
+            template = self.templates[suggestion.template_id]
+            slots, slot_resolution_trace = self._resolve_slots_for_template(
+                template,
+                slots,
+                include_defaults=True,
+            )
+            requirement_report = evaluate_slot_requirements(template, slots)
+            missing_slots = requirement_report.missing_slots
+            status = MatchStatus.MATCHED if requirement_report.is_satisfied else MatchStatus.PARTIAL
         return MatchResult(
             template_id=suggestion.template_id,
-            status=suggestion.status,
+            status=status,
             score=suggestion.score,
             query_mode=suggestion.query_mode,
-            slots=suggestion.slots,
-            missing_slots=suggestion.missing_slots,
+            slots=slots,
+            missing_slots=missing_slots,
             metadata=suggestion.metadata,
             trace={
                 "norm_text": norm_text,
                 "fallback_used": True,
                 "fallback_trace": suggestion.trace,
+                "slot_resolution": slot_resolution_trace,
                 "top_candidates": [candidate.to_dict() for candidate in ranked[:5]],
             },
+        )
+
+    def _build_nl2sql_route_result(
+        self,
+        *,
+        reason: str,
+        norm_text: str,
+        original_norm_text: str,
+        rewrite_trace: dict[str, object],
+        slots: dict[str, object],
+        ranked: list[TemplateCandidate],
+    ) -> TemplateRouteDecision:
+        top = ranked[0] if ranked else None
+        result = MatchResult(
+            template_id=-1,
+            status=MatchStatus.UNMATCHED,
+            score=top.score if top is not None else 0.0,
+            query_mode=None,
+            slots=slots,
+            missing_slots=[],
+            trace={
+                "norm_text": norm_text,
+                "original_norm_text": original_norm_text,
+                "rewrite_trace": rewrite_trace,
+                "route_to": "nl2sql",
+                "reason": reason,
+                "top_candidates": [candidate.to_dict() for candidate in ranked[:5]],
+                "template_route_min_score": self.config.settings.template_route_min_score,
+                "template_route_min_structure_score": self.config.settings.template_route_min_structure_score,
+            },
+        )
+        return TemplateRouteDecision(
+            route_to="nl2sql",
+            result=result,
+            reason=reason,
+            candidates=ranked[:5],
         )
 
 
@@ -783,7 +1055,7 @@ def _merge_slot_maps(*slot_maps: dict[str, object]) -> dict[str, object]:
     merged: dict[str, object] = {}
     for slot_map in slot_maps:
         for slot_name, value in slot_map.items():
-            if value in (None, ""):
+            if not _slot_value_present(value):
                 continue
             merged[slot_name] = value
     return merged
@@ -794,7 +1066,7 @@ def _unexpected_global_slots(template: TemplateDefinition, global_slots: dict[st
     extracted_slots = {
         slot_name
         for slot_name, value in global_slots.items()
-        if value not in (None, "")
+        if _slot_value_present(value)
     }
     return sorted(extracted_slots - supported_slots)
 
@@ -807,3 +1079,79 @@ def _weights_without_score_part(weights: dict[str, float], field_name: str) -> d
         if name != field_name
     }
     return stripped or dict(weights)
+
+
+def _derive_slot_value(rule: DerivedSlotDefinition, slots: dict[str, object]) -> object | None:
+    source_values: list[object] = []
+    for slot_name in rule.source_slots:
+        value = slots.get(slot_name)
+        if not _slot_value_present(value):
+            if rule.require_all_sources:
+                return None
+            source_values.append("")
+            continue
+        source_values.append(value)
+
+    mapping = rule.mapping
+    if isinstance(mapping, dict):
+        key = rule.key_separator.join(_slot_value_key(value) for value in source_values)
+        if key in mapping:
+            return copy.deepcopy(mapping[key])
+        return copy.deepcopy(rule.default)
+
+    if isinstance(mapping, list):
+        for item in mapping:
+            if not isinstance(item, dict):
+                continue
+            conditions = item.get("when", item.get("source_values", {}))
+            if isinstance(conditions, list):
+                conditions = {
+                    slot_name: conditions[index]
+                    for index, slot_name in enumerate(rule.source_slots)
+                    if index < len(conditions)
+                }
+            if not isinstance(conditions, dict):
+                continue
+            if all(_slot_value_matches(slots.get(str(slot_name)), expected) for slot_name, expected in conditions.items()):
+                return copy.deepcopy(item.get("value"))
+    return copy.deepcopy(rule.default)
+
+
+def _slot_value_key(value: object) -> str:
+    if isinstance(value, dict):
+        for key in ("id", "value", "code", "preset"):
+            if key in value:
+                return str(value[key])
+    return str(value)
+
+
+def _slot_value_matches(actual: object, expected: object) -> bool:
+    if not _slot_value_present(actual):
+        return False
+    if isinstance(expected, list):
+        return any(_slot_value_matches(actual, item) for item in expected)
+    actual_candidates = _slot_value_candidates(actual)
+    expected_candidates = _slot_value_candidates(expected)
+    return bool(actual_candidates & expected_candidates)
+
+
+def _slot_value_candidates(value: object) -> set[str]:
+    if isinstance(value, dict):
+        candidates: set[str] = set()
+        for key in ("id", "value", "code", "preset"):
+            if key in value:
+                candidates.add(str(value[key]).lower())
+        if not candidates:
+            candidates.add(str(value).lower())
+        return candidates
+    return {str(value).lower()}
+
+
+def _slot_value_present(value: object) -> bool:
+    if value in (None, ""):
+        return False
+    if isinstance(value, list) and not value:
+        return False
+    if isinstance(value, dict) and not value:
+        return False
+    return True

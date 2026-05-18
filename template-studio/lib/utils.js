@@ -46,6 +46,11 @@ export const DEFAULT_MATCHER = {
     min_score: 0.58,
     allow_on_matched: false
   },
+  template_route: {
+    min_score: 0.58,
+    min_structure_score: 0,
+    top_k: 1
+  },
   vector: {
     provider: "local_tfidf",
     dimension: 512
@@ -125,6 +130,10 @@ export function normalizeConfig(payload) {
       ...DEFAULT_MATCHER.llm_slot_fallback,
       ...ensureObject(matcher.llm_slot_fallback)
     },
+    template_route: {
+      ...DEFAULT_MATCHER.template_route,
+      ...ensureObject(matcher.template_route)
+    },
     vector: {
       provider: String(vector.provider ?? DEFAULT_MATCHER.vector.provider),
       dimension: Number(vector.dimension ?? DEFAULT_MATCHER.vector.dimension)
@@ -161,6 +170,9 @@ export function normalizeTemplate(template, index = 0) {
     negative_terms: ensureArray(item.negative_terms).map((value) => String(value)).filter(Boolean),
     slot_constraints: normalizeConstraintMap(item.slot_constraints),
     slot_extractors: normalizeSlotExtractorMap(item.slot_extractors),
+    slot_defaults: ensureObject(item.slot_defaults),
+    derived_slots: normalizeDerivedSlots(item.derived_slots),
+    slot_validations: normalizeValidationMap(item.slot_validations),
     llm_slot_extraction: {
       enabled: Boolean(llm.enabled),
       slots: ensureArray(llm.slots).map((value) => String(value)).filter(Boolean),
@@ -183,6 +195,9 @@ export function createBlankTemplate() {
     negative_terms: ["原因", "根因", "报告", "总结", "预测"],
     slot_constraints: {},
     slot_extractors: {},
+    slot_defaults: {},
+    derived_slots: [],
+    slot_validations: {},
     llm_slot_extraction: {
       enabled: false,
       slots: [],
@@ -249,8 +264,35 @@ function normalizeExtractor(extractor) {
         }))
     };
   }
+  if (type === "time_range") {
+    return {
+      type: "time_range",
+      include_absolute: Boolean(item.include_absolute ?? true)
+    };
+  }
+  if (type === "metric_conditions") {
+    return {
+      type: "metric_conditions",
+      metrics: ensureArray(item.metrics)
+        .filter((entry) => entry && typeof entry === "object")
+        .map((entry) => ({
+          terms: ensureArray(entry.terms).map((term) => String(term)).filter(Boolean),
+          value: entry.value ?? entry.metric ?? null
+        })),
+      operators: ensureArray(item.operators)
+        .filter((entry) => entry && typeof entry === "object")
+        .map((entry) => ({
+          terms: ensureArray(entry.terms).map((term) => String(term)).filter(Boolean),
+          value: String(entry.value || "")
+        })),
+      max_gap_chars: Number(item.max_gap_chars ?? 24),
+      value_type: String(item.value_type || "float"),
+      value_pattern: String(item.value_pattern || "(-?\\d+(?:\\.\\d+)?)\\s*%?")
+    };
+  }
   return {
     type: "keyword_value",
+    match_policy: String(item.match_policy || "first"),
     cases: ensureArray(item.cases)
       .filter((entry) => entry && typeof entry === "object")
       .map((entry) => ({
@@ -258,6 +300,41 @@ function normalizeExtractor(extractor) {
         value: entry.value ?? null
       }))
   };
+}
+
+function normalizeDerivedSlots(value) {
+  if (Array.isArray(value)) {
+    return value.filter((entry) => entry && typeof entry === "object").map((entry) => normalizeDerivedSlot(entry));
+  }
+  const input = ensureObject(value);
+  return Object.entries(input).map(([slotName, definition]) =>
+    normalizeDerivedSlot({
+      ...ensureObject(definition),
+      slot_name: ensureObject(definition).slot_name || slotName
+    })
+  );
+}
+
+function normalizeDerivedSlot(value) {
+  const input = ensureObject(value);
+  return {
+    slot_name: String(input.slot_name || ""),
+    source_slots: ensureArray(input.source_slots).map((slot) => String(slot)).filter(Boolean),
+    mapping: Array.isArray(input.mapping) || (input.mapping && typeof input.mapping === "object") ? input.mapping : [],
+    default: input.default ?? null,
+    key_separator: String(input.key_separator || "."),
+    overwrite: Boolean(input.overwrite),
+    require_all_sources: Boolean(input.require_all_sources ?? true)
+  };
+}
+
+function normalizeValidationMap(value) {
+  const input = ensureObject(value);
+  return Object.fromEntries(
+    Object.entries(input)
+      .filter(([, rule]) => rule && typeof rule === "object" && !Array.isArray(rule))
+      .map(([slotName, rule]) => [String(slotName), { ...rule }])
+  );
 }
 
 function normalizeConstraintMap(value) {

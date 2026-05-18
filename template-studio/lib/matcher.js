@@ -93,22 +93,45 @@ export class TemplateMatcher {
     }
 
     const template = this.templates[top.template_id];
-    const missingSlots = missingRequiredSlots(template, top.slots);
+    const finalized = this.rebuildCandidate(top, normText, { includeDefaults: true });
+    const missingSlots = missingRequiredSlots(template, finalized.slots);
     const status = missingSlots.length ? "partial" : "matched";
     return {
       template_id: template.template_id,
       status,
-      score: top.score,
+      score: finalized.score,
       query_mode: template.query_mode,
-      slots: top.slots,
+      slots: finalized.slots,
       missing_slots: missingSlots,
       metadata: template.metadata,
       trace: {
         norm_text: normText,
         original_norm_text: originalNormText,
         rewrite_trace: rewriteResult,
-        selected_template: top,
-        top_candidates: ranked.slice(0, 5)
+        selected_template: finalized,
+        top_candidates: [finalized, ...ranked.filter((item) => item.template_id !== finalized.template_id)].slice(0, 5)
+      }
+    };
+  }
+
+  routeForSql(inputText, options = {}) {
+    const result = this.match(inputText, options);
+    if (result.status === "matched" && result.score >= Number(this.settings.template_route?.min_score ?? this.settings.match_threshold)) {
+      return {
+        route_to: "template",
+        reason: "template_satisfied",
+        result
+      };
+    }
+    return {
+      route_to: "nl2sql",
+      reason: result.trace?.reason || "template_requirements_not_satisfied",
+      result: {
+        ...result,
+        template_id: -1,
+        status: "unmatched",
+        query_mode: null,
+        missing_slots: []
       }
     };
   }
@@ -181,8 +204,16 @@ export class TemplateMatcher {
       ...(template.required_slots || []),
       ...(template.optional_slots || []),
       ...Object.keys(template.slot_constraints || {}),
-      ...Object.keys(template.slot_extractors || {})
+      ...Object.keys(template.slot_extractors || {}),
+      ...Object.keys(template.slot_defaults || {}),
+      ...Object.keys(template.slot_validations || {})
     ]);
+    for (const rule of template.derived_slots || []) {
+      relevantSlots.add(rule.slot_name);
+      for (const sourceSlot of rule.source_slots || []) {
+        relevantSlots.add(sourceSlot);
+      }
+    }
     const merged = {};
     for (const slotName of relevantSlots) {
       const localDefinition = template.slot_extractors?.[slotName];
@@ -215,6 +246,8 @@ export class TemplateMatcher {
 
   buildCandidate({ templateId, normText, lexicalScore, sampleScore, vectorScore, fusionScore, slots, weights }) {
     const template = this.templates[templateId];
+    const slotResolution = this.resolveSlots(template, slots, { includeDefaults: false });
+    slots = slotResolution.slots;
     const slotScore = slotFitScore(template, slots);
     const constraint = constraintScore(template, normText, slots);
     const structure = structuralAlignmentScore(template, slots);
@@ -247,8 +280,75 @@ export class TemplateMatcher {
       slots,
       missing_slots: missingRequiredSlots(template, slots),
       metadata: template.metadata,
-      trace: {}
+      trace: {
+        slot_resolution: slotResolution.trace
+      }
     };
+  }
+
+  rebuildCandidate(candidate, normText, { includeDefaults = false } = {}) {
+    const weights = adaptiveScoreWeights(this.settings.weights, candidate.slots);
+    const rebuilt = this.buildCandidate({
+      templateId: candidate.template_id,
+      normText,
+      lexicalScore: candidate.lexical_score,
+      sampleScore: candidate.sample_score,
+      vectorScore: candidate.vector_score,
+      fusionScore: candidate.fusion_score,
+      slots: candidate.slots,
+      weights
+    });
+    if (!includeDefaults) {
+      return rebuilt;
+    }
+    const template = this.templates[candidate.template_id];
+    const slotResolution = this.resolveSlots(template, rebuilt.slots, { includeDefaults: true });
+    return this.buildCandidate({
+      templateId: candidate.template_id,
+      normText,
+      lexicalScore: candidate.lexical_score,
+      sampleScore: candidate.sample_score,
+      vectorScore: candidate.vector_score,
+      fusionScore: candidate.fusion_score,
+      slots: slotResolution.slots,
+      weights
+    });
+  }
+
+  resolveSlots(template, slots, { includeDefaults = false } = {}) {
+    const resolved = deepClone(slots || {});
+    const trace = {
+      defaults_applied: {},
+      derived_applied: {}
+    };
+    if (includeDefaults) {
+      for (const [slotName, value] of Object.entries(template.slot_defaults || {})) {
+        if (slotValuePresent(resolved[slotName])) {
+          continue;
+        }
+        resolved[slotName] = deepClone(value);
+        trace.defaults_applied[slotName] = deepClone(value);
+      }
+    }
+    for (let pass = 0; pass < 3; pass += 1) {
+      let changed = false;
+      for (const rule of template.derived_slots || []) {
+        if (!rule.overwrite && slotValuePresent(resolved[rule.slot_name])) {
+          continue;
+        }
+        const value = deriveSlotValue(rule, resolved);
+        if (!slotValuePresent(value)) {
+          continue;
+        }
+        resolved[rule.slot_name] = deepClone(value);
+        trace.derived_applied[rule.slot_name] = deepClone(value);
+        changed = true;
+      }
+      if (!changed) {
+        break;
+      }
+    }
+    return { slots: resolved, trace };
   }
 
   isAmbiguous(top, second) {
@@ -285,4 +385,90 @@ function filterRanking(ranking, scopeIds) {
     return ranking;
   }
   return ranking.filter(([templateId]) => scopeIds.has(templateId));
+}
+
+function deriveSlotValue(rule, slots) {
+  const sourceValues = [];
+  for (const slotName of rule.source_slots || []) {
+    const value = slots[slotName];
+    if (!slotValuePresent(value)) {
+      if (rule.require_all_sources !== false) {
+        return null;
+      }
+      sourceValues.push("");
+      continue;
+    }
+    sourceValues.push(value);
+  }
+  const mapping = rule.mapping;
+  if (mapping && !Array.isArray(mapping) && typeof mapping === "object") {
+    const key = sourceValues.map(slotValueKey).join(rule.key_separator || ".");
+    return mapping[key] ?? rule.default ?? null;
+  }
+  if (Array.isArray(mapping)) {
+    for (const item of mapping) {
+      const conditions = Array.isArray(item.source_values)
+        ? Object.fromEntries((rule.source_slots || []).map((slotName, index) => [slotName, item.source_values[index]]))
+        : item.when;
+      if (!conditions || typeof conditions !== "object") {
+        continue;
+      }
+      if (Object.entries(conditions).every(([slotName, expected]) => slotValueMatches(slots[slotName], expected))) {
+        return item.value ?? null;
+      }
+    }
+  }
+  return rule.default ?? null;
+}
+
+function slotValueMatches(actual, expected) {
+  if (!slotValuePresent(actual)) {
+    return false;
+  }
+  if (Array.isArray(expected)) {
+    return expected.some((item) => slotValueMatches(actual, item));
+  }
+  const actualCandidates = slotValueCandidates(actual);
+  const expectedCandidates = slotValueCandidates(expected);
+  return [...actualCandidates].some((item) => expectedCandidates.has(item));
+}
+
+function slotValueCandidates(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const candidates = new Set();
+    for (const key of ["id", "value", "code", "preset"]) {
+      if (value[key] !== undefined) {
+        candidates.add(String(value[key]).toLowerCase());
+      }
+    }
+    if (!candidates.size) {
+      candidates.add(JSON.stringify(value).toLowerCase());
+    }
+    return candidates;
+  }
+  return new Set([String(value).toLowerCase()]);
+}
+
+function slotValueKey(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    for (const key of ["id", "value", "code", "preset"]) {
+      if (value[key] !== undefined) {
+        return String(value[key]);
+      }
+    }
+  }
+  return String(value);
+}
+
+function slotValuePresent(value) {
+  if (value === null || value === undefined || value === "") {
+    return false;
+  }
+  if (Array.isArray(value) && !value.length) {
+    return false;
+  }
+  if (value && typeof value === "object" && !Array.isArray(value) && !Object.keys(value).length) {
+    return false;
+  }
+  return true;
 }

@@ -13,7 +13,16 @@ from template_capability.text_matching import match_text_rule
 
 TOKEN_RE = re.compile(r"[a-z0-9_.-]+|[\u4e00-\u9fff]+")
 LOW_SIGNAL_SLOTS = {"time_range", "region_id"}
-FILTER_SLOTS = {"query_operator", "topn", "severity", "device_id", "protocol", "selector_type", "selector_value"}
+FILTER_SLOTS = {
+    "query_operator",
+    "topn",
+    "severity",
+    "device_id",
+    "protocol",
+    "selector_type",
+    "selector_value",
+    "metric_conditions",
+}
 
 
 @dataclass(slots=True)
@@ -90,7 +99,7 @@ class StructureAlignmentReport:
 
 
 def mixed_terms(text: str) -> list[str]:
-    """混合 token + char ngram，兼顾中文短句和提参变化。"""
+    """混合 token + ，兼顾中文短句和提参变化。"""
     chunks = TOKEN_RE.findall(text.lower())
     terms: list[str] = []
     for chunk in chunks:
@@ -326,6 +335,9 @@ def slot_fit_score(template: TemplateDefinition, slots: dict[str, Any]) -> float
             sum(_mutual_exclusion_score(group.slots, slots) for group in template.mutually_exclusive_slots)
             / len(template.mutually_exclusive_slots)
         )
+    validation_scores = _slot_validation_scores(template, slots)
+    if validation_scores:
+        requirement_scores.append(sum(validation_scores) / len(validation_scores))
     required_hit = sum(requirement_scores) / len(requirement_scores) if requirement_scores else 1.0
     if not optional:
         return required_hit
@@ -361,12 +373,12 @@ def evaluate_structural_alignment(
     extracted_query_slots = {
         slot_name
         for slot_name, value in query_slots.items()
-        if value not in (None, "")
+        if _value_present(value)
     }
     extracted_candidate_slots = {
         slot_name
         for slot_name, value in candidate_slots.items()
-        if value not in (None, "")
+        if _value_present(value)
     }
     if not extracted_query_slots:
         return StructureAlignmentReport(
@@ -532,7 +544,7 @@ def adaptive_score_weights(
     否则多条件 query 很容易被单条件模板抢走。
     """
     weights = {name: float(value) for name, value in base_weights.items()}
-    filter_slot_count = sum(1 for slot_name, value in slots.items() if value not in (None, "") and _is_filter_slot(slot_name))
+    filter_slot_count = sum(1 for slot_name, value in slots.items() if _value_present(value) and _is_filter_slot(slot_name))
     complexity = min(1.0, filter_slot_count / 3.0)
     if complexity <= 0:
         return _normalize_weights(weights)
@@ -653,6 +665,41 @@ def evaluate_slot_requirements(
             )
         )
 
+    for slot_name, rule in template.slot_validations.items():
+        count = _slot_item_count(slots.get(slot_name))
+        exact_items = rule.get("exact_items")
+        min_items = rule.get("min_items")
+        max_items = rule.get("max_items")
+        if exact_items not in (None, ""):
+            expected = int(exact_items)
+            if count != expected:
+                _extend_unique(missing_slots, [slot_name])
+                issues.append(
+                    RequirementIssue(
+                        kind="slot_exact_items",
+                        slots=[slot_name],
+                        message=f"slot '{slot_name}' must contain exactly {expected} item(s).",
+                    )
+                )
+                continue
+        if min_items not in (None, "") and count < int(min_items):
+            _extend_unique(missing_slots, [slot_name])
+            issues.append(
+                RequirementIssue(
+                    kind="slot_min_items",
+                    slots=[slot_name],
+                    message=f"slot '{slot_name}' must contain at least {int(min_items)} item(s).",
+                )
+            )
+        if max_items not in (None, "") and count > int(max_items):
+            issues.append(
+                RequirementIssue(
+                    kind="slot_max_items",
+                    slots=[slot_name],
+                    message=f"slot '{slot_name}' must contain at most {int(max_items)} item(s).",
+                )
+            )
+
     return SlotRequirementReport(
         missing_slots=missing_slots,
         issues=issues,
@@ -663,7 +710,7 @@ def _coverage_score(slot_names: list[str], slots: dict[str, Any]) -> float:
     """简单覆盖率，用于 required/optional 的命中统计。"""
     if not slot_names:
         return 1.0
-    hit = sum(1 for slot_name in slot_names if slots.get(slot_name) not in (None, ""))
+    hit = sum(1 for slot_name in slot_names if _slot_present(slots, slot_name))
     return hit / len(slot_names)
 
 
@@ -687,6 +734,27 @@ def _mutual_exclusion_score(slot_names: list[str], slots: dict[str, Any]) -> flo
     return 1.0 if filled_count <= 1 else 0.0
 
 
+def _slot_validation_scores(template: TemplateDefinition, slots: dict[str, Any]) -> list[float]:
+    return [
+        _slot_validation_score(slot_name, rule, slots)
+        for slot_name, rule in template.slot_validations.items()
+    ]
+
+
+def _slot_validation_score(slot_name: str, rule: dict[str, Any], slots: dict[str, Any]) -> float:
+    count = _slot_item_count(slots.get(slot_name))
+    exact_items = rule.get("exact_items")
+    if exact_items not in (None, ""):
+        return 1.0 if count == int(exact_items) else 0.0
+    min_items = rule.get("min_items")
+    max_items = rule.get("max_items")
+    if min_items not in (None, "") and count < int(min_items):
+        return count / max(1, int(min_items))
+    if max_items not in (None, "") and count > int(max_items):
+        return max(0.0, int(max_items) / max(1, count))
+    return 1.0
+
+
 def _requirement_completeness_score(template: TemplateDefinition, slots: dict[str, Any]) -> float:
     """把模板自己的必填规则聚合成一个完整度分数。"""
     weighted_components: list[tuple[float, float]] = []
@@ -706,6 +774,8 @@ def _requirement_completeness_score(template: TemplateDefinition, slots: dict[st
             weighted_components.append(
                 (_slot_signal_weight(slot_name), 1.0 if _slot_present(slots, slot_name) else 0.0)
             )
+    for slot_name, rule in template.slot_validations.items():
+        weighted_components.append((_slot_signal_weight(slot_name), _slot_validation_score(slot_name, rule, slots)))
     if not weighted_components:
         return 1.0
     total_weight = sum(weight for weight, _ in weighted_components)
@@ -723,7 +793,7 @@ def _requirement_penalties(
     query_weight = sum(
         _slot_signal_weight(slot_name)
         for slot_name, value in query_slots.items()
-        if value not in (None, "")
+        if _value_present(value)
     )
     required_weight = _template_requirement_weight(template)
     normalizer = max(1.0, query_weight, required_weight)
@@ -785,6 +855,8 @@ def _flatten_value(value: Any) -> set[str]:
 
 def _slot_signal_weight(slot_name: str) -> float:
     """不同槽位对结构判断的价值不同。"""
+    if slot_name == "metric_conditions":
+        return 2.0
     if slot_name in LOW_SIGNAL_SLOTS:
         # 时间、区域对问数模板通常只是修饰信息，不应该像过滤条件那样强影响结构分。
         return 0.5
@@ -804,6 +876,8 @@ def _template_requirement_weight(template: TemplateDefinition) -> float:
         total += sum(_slot_signal_weight(slot_name) for slot_name in rule.require)
     for group in template.mutually_exclusive_slots:
         total += sum(_slot_signal_weight(slot_name) for slot_name in group.slots) / max(1, len(group.slots))
+    for slot_name in template.slot_validations:
+        total += _slot_signal_weight(slot_name)
     return total or 1.0
 
 
@@ -841,7 +915,27 @@ def _normalize_weights(weights: dict[str, float]) -> dict[str, float]:
 
 
 def _slot_present(slots: dict[str, Any], slot_name: str) -> bool:
-    return slots.get(slot_name) not in (None, "")
+    return _value_present(slots.get(slot_name))
+
+
+def _value_present(value: Any) -> bool:
+    if value in (None, ""):
+        return False
+    if isinstance(value, list) and not value:
+        return False
+    if isinstance(value, dict) and not value:
+        return False
+    return True
+
+
+def _slot_item_count(value: Any) -> int:
+    if value in (None, ""):
+        return 0
+    if isinstance(value, list):
+        return len(value)
+    if isinstance(value, dict):
+        return 1 if value else 0
+    return 1
 
 
 def _triggered_slots(

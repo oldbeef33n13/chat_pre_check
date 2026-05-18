@@ -69,6 +69,15 @@ app.post("/api/match", async (req, res) => {
   res.json({ ok: true, result });
 });
 
+app.post("/api/route-for-sql", async (req, res) => {
+  const text = String(req.body?.text || "");
+  const config = normalizeConfig(req.body?.config || (await loadWorkspaceConfig()).config);
+  const templateIds = Array.isArray(req.body?.templateIds) ? req.body.templateIds.map(String) : null;
+  const matcher = new TemplateMatcher(config, { baseDir: ROOT });
+  const decision = matcher.routeForSql(text, { templateIds });
+  res.json({ ok: true, decision });
+});
+
 app.post("/api/batch/parse", async (req, res) => {
   try {
     const content = String(req.body?.content || "");

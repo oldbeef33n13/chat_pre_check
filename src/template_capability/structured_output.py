@@ -91,6 +91,21 @@ def build_slot_fill_schema(template: TemplateDefinition, target_slots: list[str]
 
 def infer_slot_json_schema(template: TemplateDefinition, slot_name: str) -> dict[str, Any]:
     """根据模板约束和 extractor 线索，尽量收窄单个槽位的 JSON schema。"""
+    if slot_name == "metric_conditions" or _extractor_type_exists(template, slot_name, "metric_conditions"):
+        return {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": True,
+                "required": ["metric", "operator", "value"],
+                "properties": {
+                    "metric": JSON_ANY_SCHEMA,
+                    "operator": {"type": "string", "enum": [">", ">=", "<", "<=", "=", "!="]},
+                    "value": {"type": "number"},
+                    "raw": {"type": "string"},
+                },
+            },
+        }
     allowed_values = template.slot_constraints.get(slot_name, [])
     enum_values = _collect_enum_values(template, slot_name, allowed_values)
     if enum_values:
@@ -152,6 +167,14 @@ def _infer_regex_value_type(template: TemplateDefinition, slot_name: str) -> str
             if mapped is not None:
                 return mapped
     return None
+
+
+def _extractor_type_exists(template: TemplateDefinition, slot_name: str, extractor_type: str) -> bool:
+    definition = template.slot_extractors.get(slot_name)
+    if definition is None:
+        return False
+    expected = extractor_type.strip().lower()
+    return any(str(extractor.get("type", "")).strip().lower() == expected for extractor in definition.extractors)
 
 
 def _numeric_schema(kind: str, template: TemplateDefinition, slot_name: str) -> dict[str, Any]:

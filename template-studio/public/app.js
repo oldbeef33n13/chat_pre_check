@@ -303,6 +303,18 @@ function renderEditor() {
             <textarea id="field-slot-extractors" class="json-editor" rows="12">${escapeHtml(formatJson(template.slot_extractors))}</textarea>
           </label>
           <label class="field full-span">
+            <span>slot_defaults（JSON）</span>
+            <textarea id="field-slot-defaults" class="json-editor" rows="6">${escapeHtml(formatJson(template.slot_defaults || {}))}</textarea>
+          </label>
+          <label class="field full-span">
+            <span>derived_slots（JSON）</span>
+            <textarea id="field-derived-slots" class="json-editor" rows="8">${escapeHtml(formatJson(template.derived_slots || []))}</textarea>
+          </label>
+          <label class="field full-span">
+            <span>slot_validations（JSON）</span>
+            <textarea id="field-slot-validations" class="json-editor" rows="6">${escapeHtml(formatJson(template.slot_validations || {}))}</textarea>
+          </label>
+          <label class="field full-span">
             <span>llm_slot_extraction（JSON）</span>
             <textarea id="field-llm-slot-extraction" class="json-editor" rows="7">${escapeHtml(formatJson(template.llm_slot_extraction))}</textarea>
           </label>
@@ -364,6 +376,15 @@ function renderEditor() {
   });
   bindJsonField("field-slot-extractors", (json) => {
     template.slot_extractors = json;
+  });
+  bindJsonField("field-slot-defaults", (json) => {
+    template.slot_defaults = json;
+  });
+  bindJsonField("field-derived-slots", (json) => {
+    template.derived_slots = json;
+  });
+  bindJsonField("field-slot-validations", (json) => {
+    template.slot_validations = json;
   });
   bindJsonField("field-llm-slot-extraction", (json) => {
     template.llm_slot_extraction = json;
@@ -1114,6 +1135,9 @@ function createBlankTemplate() {
     negative_terms: ["原因", "根因", "报告", "总结", "预测"],
     slot_constraints: {},
     slot_extractors: {},
+    slot_defaults: {},
+    derived_slots: [],
+    slot_validations: {},
     llm_slot_extraction: {
       enabled: false,
       slots: [],

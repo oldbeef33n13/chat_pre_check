@@ -13,6 +13,7 @@ from template_capability.models import (
     DEFAULT_RERANKER_PROVIDER,
     DEFAULT_SCORE_WEIGHTS,
     DEFAULT_VECTOR_PROVIDER,
+    DerivedSlotDefinition,
     MatcherSettings,
     QueryRewriteRule,
     QueryRewriteSettings,
@@ -51,6 +52,7 @@ def load_template_config(path: str | Path) -> TemplateConfig:
     reranker_payload = matcher_payload.get("reranker", {})
     fallback_payload = matcher_payload.get("llm_fallback", {})
     slot_fallback_payload = matcher_payload.get("llm_slot_fallback", {})
+    template_route_payload = matcher_payload.get("template_route", {})
     weights = {
         str(key): float(value)
         for key, value in matcher_payload.get("weights", {}).items()
@@ -85,6 +87,9 @@ def load_template_config(path: str | Path) -> TemplateConfig:
         llm_slot_fallback_max_missing_slots=int(slot_fallback_payload.get("max_missing_slots", 2)),
         llm_slot_fallback_min_score=float(slot_fallback_payload.get("min_score", matcher_payload.get("match_threshold", 0.58))),
         llm_slot_fallback_allow_on_matched=bool(slot_fallback_payload.get("allow_on_matched", False)),
+        template_route_min_score=float(template_route_payload.get("min_score", matcher_payload.get("match_threshold", 0.58))),
+        template_route_min_structure_score=float(template_route_payload.get("min_structure_score", 0.0)),
+        template_route_top_k=int(template_route_payload.get("top_k", 1)),
     )
 
     query_rewrite = QueryRewriteSettings(
@@ -147,6 +152,13 @@ def load_template_config(path: str | Path) -> TemplateConfig:
                 )
                 for slot_name, definition in item.get("slot_extractors", {}).items()
                 if isinstance(definition, dict)
+            },
+            slot_defaults=dict(item.get("slot_defaults", {})),
+            derived_slots=_build_derived_slot_definitions(item.get("derived_slots", [])),
+            slot_validations={
+                str(slot_name): dict(rule)
+                for slot_name, rule in item.get("slot_validations", {}).items()
+                if isinstance(rule, dict)
             },
             llm_slot_extraction=dict(item.get("llm_slot_extraction", {})),
             metadata=dict(item.get("metadata", {})),
@@ -255,6 +267,45 @@ def _build_conditional_slot_requirements(value: Any) -> list[ConditionalSlotRequ
             )
         )
     return rules
+
+
+def _build_derived_slot_definitions(value: Any) -> list[DerivedSlotDefinition]:
+    """兼容列表写法和对象写法。
+
+    支持：
+    - [{"slot_name": "healthStatus", ...}]
+    - {"healthStatus": {"source_slots": [...], "mapping": {...}}}
+    """
+
+    raw_items: list[dict[str, Any]] = []
+    if isinstance(value, list):
+        raw_items = [dict(item) for item in value if isinstance(item, dict)]
+    elif isinstance(value, dict):
+        for slot_name, definition in value.items():
+            if not isinstance(definition, dict):
+                continue
+            item = dict(definition)
+            item.setdefault("slot_name", slot_name)
+            raw_items.append(item)
+    definitions: list[DerivedSlotDefinition] = []
+    for item in raw_items:
+        slot_name = str(item.get("slot_name", "")).strip()
+        source_slots = _normalize_slot_name_list(item.get("source_slots", []))
+        mapping = item.get("mapping", [])
+        if not slot_name or not source_slots:
+            continue
+        definitions.append(
+            DerivedSlotDefinition(
+                slot_name=slot_name,
+                source_slots=source_slots,
+                mapping=mapping if isinstance(mapping, (list, dict)) else [],
+                default=item.get("default"),
+                key_separator=str(item.get("key_separator", ".") or "."),
+                overwrite=bool(item.get("overwrite", False)),
+                require_all_sources=bool(item.get("require_all_sources", True)),
+            )
+        )
+    return definitions
 
 
 def _normalize_slot_name_list(value: Any) -> list[str]:

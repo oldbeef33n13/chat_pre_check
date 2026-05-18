@@ -27,6 +27,7 @@ DEFAULT_VECTOR_PROVIDER = "local_tfidf"
 DEFAULT_RERANKER_PROVIDER = "none"
 DEFAULT_RERANK_WEIGHT = 0.12
 SUPPORTED_TEXT_MATCH_MODES = {"substring", "whole_word", "exact"}
+SUPPORTED_KEYWORD_MATCH_POLICIES = {"first", "longest"}
 
 
 @dataclass(slots=True)
@@ -145,6 +146,12 @@ class MatcherSettings:
     llm_slot_fallback_min_score: float = 0.58
     # 是否允许对已经 MATCHED 的模板也尝试再补充可选槽位。
     llm_slot_fallback_allow_on_matched: bool = False
+    # 面向 SQL 路由的高置信模板准入阈值；默认跟主匹配阈值保持一致。
+    template_route_min_score: float = 0.0
+    # SQL 路由时要求模板结构分达到的下限，避免文本像但结构接不住的模板放行。
+    template_route_min_structure_score: float = 0.0
+    # SQL 路由提参最多查看几个候选；默认 top1，低延迟优先。
+    template_route_top_k: int = 1
 
     def __post_init__(self) -> None:
         # 兼容直接手写 MatcherSettings 的场景；未传权重时补默认值。
@@ -158,6 +165,9 @@ class MatcherSettings:
             # 只有显式打开 reranker 时，才自动补一个保守权重，避免老配置被无意改变。
             self.weights["rerank"] = DEFAULT_RERANK_WEIGHT
         self.blocked_terms = build_text_match_rules(self.blocked_terms)
+        if self.template_route_min_score <= 0:
+            self.template_route_min_score = self.match_threshold
+        self.template_route_top_k = max(1, int(self.template_route_top_k))
 
 
 @dataclass(slots=True)
@@ -215,6 +225,34 @@ class ConditionalSlotRequirement:
 
 
 @dataclass(slots=True)
+class DerivedSlotDefinition:
+    """由多个已有槽位确定性派生出的槽位。
+
+    典型场景是同一个语义值在不同资源类型下映射到不同后端枚举：
+    `resource_type=disk + health_status_label=normal -> healthStatus=2`。
+    """
+
+    slot_name: str
+    source_slots: list[str]
+    mapping: list[dict[str, Any]] | dict[str, Any]
+    default: Any | None = None
+    key_separator: str = "."
+    overwrite: bool = False
+    require_all_sources: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "slot_name": self.slot_name,
+            "source_slots": list(self.source_slots),
+            "mapping": self.mapping,
+            "default": self.default,
+            "key_separator": self.key_separator,
+            "overwrite": self.overwrite,
+            "require_all_sources": self.require_all_sources,
+        }
+
+
+@dataclass(slots=True)
 class TemplateDefinition:
     """只面向问数场景的模板定义。
 
@@ -253,6 +291,12 @@ class TemplateDefinition:
     mutually_exclusive_slots: list["SlotGroupRequirement"] = field(default_factory=list)
     # 模板自己的槽位抽取器。它优先于根级共享定义。
     slot_extractors: dict[str, "SlotExtractorDefinition"] = field(default_factory=dict)
+    # 可选槽位或执行层必需默认参数。默认值只在最终输出/SQL 路由前补齐，不参与早期召回。
+    slot_defaults: dict[str, Any] = field(default_factory=dict)
+    # 由 resource_type、状态语义等上游槽位派生出的后端字段值。
+    derived_slots: list["DerivedSlotDefinition"] = field(default_factory=list)
+    # 针对列表型槽位的数量约束，例如单指标模板要求 metric_conditions 最多 1 个。
+    slot_validations: dict[str, dict[str, Any]] = field(default_factory=dict)
     # 模板级 LLM 补参配置，只在模板已基本命中后才会使用。
     llm_slot_extraction: dict[str, Any] = field(default_factory=dict)
     # 业务附加信息，原样透传到匹配结果里，不参与排序。
@@ -355,6 +399,28 @@ class MatchResult:
         }
 
 
+@dataclass(slots=True)
+class TemplateRouteDecision:
+    """面向 SQL 执行入口的路由决策。
+
+    `match()` 仍然保留 matched / partial / unmatched 的诊断语义；
+    这个结构额外告诉上游本次是否应该直接走模板 SQL，还是回退 NL2SQL。
+    """
+
+    route_to: str
+    result: MatchResult
+    reason: str
+    candidates: list[TemplateCandidate] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "route_to": self.route_to,
+            "reason": self.reason,
+            "result": self.result.to_dict(),
+            "candidates": [candidate.to_dict() for candidate in self.candidates],
+        }
+
+
 def template_declared_slot_names(template: TemplateDefinition) -> set[str]:
     """收集模板显式声明过的所有槽位名。
 
@@ -369,6 +435,8 @@ def template_declared_slot_names(template: TemplateDefinition) -> set[str]:
         | set(template.optional_slots)
         | set(template.slot_constraints)
         | set(template.slot_extractors)
+        | set(template.slot_defaults)
+        | set(template.slot_validations)
     )
     for group in template.required_one_of:
         declared_slots.update(group.slots)
@@ -378,6 +446,9 @@ def template_declared_slot_names(template: TemplateDefinition) -> set[str]:
         declared_slots.update(rule.require)
     for group in template.mutually_exclusive_slots:
         declared_slots.update(group.slots)
+    for rule in template.derived_slots:
+        declared_slots.add(rule.slot_name)
+        declared_slots.update(rule.source_slots)
     return declared_slots
 
 
